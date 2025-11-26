@@ -1,4 +1,4 @@
-# scraper_logic.py
+# scraper_logic.py (FIXED - REMOVED CIRCULAR IMPORT)
 import time
 from datetime import datetime
 import json
@@ -11,7 +11,11 @@ from tkinter import filedialog
 import tkinter as tk
 import shutil
 import threading
+import queue
 import platform
+import random
+import subprocess
+import tempfile
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -24,105 +28,280 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 logger = logging.getLogger(__name__)
 
-CODE_VALUE = "409573"
-PASSWORD_VALUE = "220106"
+CODE_VALUE = "014510"
+PASSWORD_VALUE = "077536"
 RUN_HEADLESS = False
+# Default: don't override the browser User-Agent unless configured.
+# Some sites block specific UAs; prefer leaving the browser default or letting the
+# user set a UA in config.ini under [Settings] user_agent = <UA string>
+DEFAULT_USER_AGENT = None
+# A small pool of realistic desktop user-agents to rotate when none is configured
+USER_AGENT_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6340.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
 TOPICS_FILE = Path("topics.json")
 LOGIN_URL = "https://www2.kolhalashon.com/#/login/%2FregularSite%2Fnew"
 CONFIG_FILE = Path("config.ini")
 
-# --- FIX: שינוי סדר הפעולות לאיתור הדרייבר ---
 def _create_webdriver_standalone(status_callback):
     status_callback("בודק הגדרות דרייבר...")
-    logger.info("Attempting to create webdriver.")
-    
     config = configparser.ConfigParser()
-    driver_path = None
     service = None
-
-    # שלב 1: בדוק אם קיים נתיב שמור ועובד
     if CONFIG_FILE.exists():
         config.read(CONFIG_FILE)
         if 'Paths' in config and 'driver_path' in config['Paths']:
             saved_path = config['Paths']['driver_path']
             if os.path.exists(saved_path):
-                driver_path = saved_path
-                logger.info(f"Using saved driver path from config.ini: {driver_path}")
                 status_callback("משתמש בנתיב דרייבר שמור.")
-                service = ChromeService(executable_path=driver_path)
-
-    # שלב 2: אם אין נתיב שמור, נסה את הדרך האוטומטית (דורש אינטרנט)
+                service = ChromeService(executable_path=saved_path, log_path=str(Path.cwd() / 'chromedriver.log'))
     if not service:
         try:
             status_callback("מנסה לאתר דרייבר אוטומטית...")
-            logger.info("No valid saved path. Trying webdriver-manager.")
-            service = ChromeService(ChromeDriverManager().install())
+            driver_bin = ChromeDriverManager().install()
+            service = ChromeService(executable_path=driver_bin, log_path=str(Path.cwd() / 'chromedriver.log'))
         except Exception as e:
-            logger.error(f"Webdriver-manager failed: {e}")
             status_callback("איתור אוטומטי נכשל. יש לבחור קובץ דרייבר ידנית.")
-            
-            # שלב 3: אם הכל נכשל, בקש מהמשתמש לבחור ידנית
-            root = tk.Tk()
-            root.withdraw()
+            root = tk.Tk(); root.withdraw()
             file_types = [("All files", "*.*")] if platform.system() == "Darwin" else [("Executable files", "*.exe")]
             manual_path = filedialog.askopenfilename(title="אנא בחר את קובץ chromedriver", filetypes=file_types)
             root.destroy()
-
             if manual_path:
-                logger.info(f"User selected manual path: {manual_path}")
                 config['Paths'] = {'driver_path': manual_path}
                 with open(CONFIG_FILE, 'w') as configfile: config.write(configfile)
-                logger.info(f"Saved new driver path to {CONFIG_FILE}")
                 service = ChromeService(executable_path=manual_path)
             else:
-                logger.critical("User did not select a driver. Aborting.")
                 status_callback("לא נבחר דרייבר. לא ניתן להמשיך.")
                 return None
-
     status_callback("מפעיל את הדפדפן...")
     chrome_options = ChromeOptions()
-    if RUN_HEADLESS:
-        chrome_options.add_argument("--headless=new")
+    # Optional: allow the user to configure using their real Chrome profile
+    # via config.ini under a [Profile] section. Keys:
+    #   use_profile = true/false
+    #   chrome_user_data_dir = C:\\Users\\you\\AppData\\Local\\Google\\Chrome\\User Data
+    #   profile_dir_name = Default
+    use_profile = False
+    profile_user_data_dir = None
+    profile_dir_name = None
+    try:
+        if CONFIG_FILE.exists():
+            config.read(CONFIG_FILE)
+            if 'Profile' in config:
+                use_profile = config['Profile'].getboolean('use_profile', fallback=False)
+                profile_user_data_dir = config['Profile'].get('chrome_user_data_dir', fallback=None)
+                profile_dir_name = config['Profile'].get('profile_dir_name', fallback=None)
+    except Exception:
+        use_profile = False
+
+    # Helper to detect running Chrome on Windows (avoids profile lock/corruption)
+    def _is_chrome_running():
+        try:
+            if platform.system() == 'Windows':
+                out = subprocess.check_output('tasklist /FI "IMAGENAME eq chrome.exe"', shell=True, text=True)
+                return 'chrome.exe' in out
+            else:
+                # On non-windows we'll try pgrep
+                out = subprocess.check_output(['pgrep', '-f', 'chrome'])
+                return bool(out.strip())
+        except Exception:
+            # If detection fails, assume not running to avoid false positives
+            return False
+
+    if use_profile and profile_user_data_dir:
+        # Expand environment vars and verify path exists
+        profile_user_data_dir = os.path.expandvars(profile_user_data_dir)
+        if not os.path.exists(profile_user_data_dir):
+            status_callback("הנתיב לפרופיל לא נמצא — משתמש בפרופיל זמני במקום.")
+            use_profile = False
+        else:
+            if _is_chrome_running():
+                status_callback("יש לסגור את כל חלונות Chrome לפני שמתחברים לפרופיל האמיתי; סגור Chrome ונסה שוב.")
+                return None
+            # Attach user data dir and (optionally) select profile directory name
+            chrome_options.add_argument(f"--user-data-dir={profile_user_data_dir}")
+            if profile_dir_name:
+                chrome_options.add_argument(f"--profile-directory={profile_dir_name}")
+            status_callback(f"מנסה להשתמש בפרופיל Chrome: {profile_dir_name or 'Default'}")
+
+    if RUN_HEADLESS: chrome_options.add_argument("--headless=new")
+    # Allow overriding the user agent from config.ini (section [Settings], key user_agent).
+    ua = None
+    try:
+        if CONFIG_FILE.exists():
+            config.read(CONFIG_FILE)
+            if 'Settings' in config and 'user_agent' in config['Settings']:
+                ua = config['Settings']['user_agent']
+    except Exception:
+        ua = None
+    # Fallback to DEFAULT_USER_AGENT if set; otherwise don't override UA so Chrome's default is used.
+    if not ua:
+        # pick a UA from pool if not configured and DEFAULT_USER_AGENT not set
+        ua = DEFAULT_USER_AGENT or random.choice(USER_AGENT_POOL)
+    if ua:
+        chrome_options.add_argument(f"--user-agent={ua}")
+        status_callback(f"מגדיר User-Agent: {ua[:60]}...")
+    else:
+        status_callback("לא שונה User-Agent — משתמש בברירת המפעל של Chrome.")
+    # Disable some automation flags that make webdriver detectable
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+    # Reduce detection surface
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--window-size=1200,900")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1400,900")
-    chrome_options.add_argument("--disable-features=RendererCodeIntegrity")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    
     temp_download_path = str(Path.home() / 'Downloads' / 'kol_halashon_temp')
     os.makedirs(temp_download_path, exist_ok=True)
+    
     prefs = {
         "download.default_directory": temp_download_path,
         "profile.default_content_setting_values.automatic_downloads": 1
     }
     chrome_options.add_experimental_option("prefs", prefs)
     
+    # Script that masks common webdriver fingerprints
+    script = '''
+    // navigator.webdriver
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    // chrome runtime
+    window.chrome = window.chrome || { runtime: {} };
+    // languages
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+    // plugins (non-empty array)
+    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+    // permissions
+    try {
+        const origQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => {
+            if (parameters && parameters.name === 'notifications') {
+                return Promise.resolve({ state: Notification.permission });
+            }
+            return origQuery(parameters);
+        };
+    } catch (e) {}
+    // prevent detection using toString checks
+    try {
+        const fnToString = Function.prototype.toString;
+        const nativeToString = fnToString.call(fnToString);
+        Function.prototype.toString = function() { return nativeToString; };
+    } catch (e) {}
+    '''
+
+    # First try: undetected-chromedriver (if installed). If it fails, fall back to normal Selenium.
+    try:
+        import undetected_chromedriver as uc
+        status_callback("מנסה undetected_chromedriver...")
+        uc_options = uc.ChromeOptions()
+        if RUN_HEADLESS:
+            uc_options.add_argument("--headless=new")
+        # If we have a UA chosen above, use it for uc as well
+        try:
+            if ua:
+                uc_options.add_argument(f"--user-agent={ua}")
+        except Exception:
+            # ua might not be defined in some paths; ignore
+            pass
+        uc_options.add_argument("--disable-blink-features=AutomationControlled")
+        uc_options.add_argument("--window-size=1200,900")
+        uc_options.add_argument("--no-sandbox")
+        uc_options.add_argument("--disable-dev-shm-usage")
+        # If we decided to attach to the real profile above, propagate that to uc as well
+        try:
+            if use_profile and profile_user_data_dir:
+                uc_options.add_argument(f"--user-data-dir={profile_user_data_dir}")
+                if profile_dir_name:
+                    uc_options.add_argument(f"--profile-directory={profile_dir_name}")
+        except Exception:
+            pass
+        uc_options.add_experimental_option("prefs", prefs)
+        driver = uc.Chrome(options=uc_options)
+        try:
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': script})
+        except Exception:
+            pass
+        return driver
+    except Exception:
+        status_callback("undetected_chromedriver לא זמין, ממשיך עם Selenium רגיל...")
+
+    # Fallback: regular Selenium-backed Chrome
     driver = webdriver.Chrome(service=service, options=chrome_options)
+    # Apply masking script to new documents
+    try:
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': script})
+    except Exception:
+        pass
+
+    # If we set a UA via chrome_options, also set it via CDP to ensure headers and navigator align
+    try:
+        if ua:
+            try:
+                driver.execute_cdp_cmd('Network.enable', {})
+                driver.execute_cdp_cmd('Network.setUserAgentOverride', {'userAgent': ua})
+            except Exception:
+                # ignore failures in UA override
+                pass
+    except Exception:
+        pass
+
     return driver
-# ----------------------------------------------------------------
 
 def initial_login(status_callback):
     driver = _create_webdriver_standalone(status_callback)
-    if not driver:
-        return None
-
+    if not driver: return None
     status_callback("מתחיל תהליך התחברות...")
-    logger.info("Navigating to login page.")
+    # Navigate to login page
     driver.get(LOGIN_URL)
+    # small pause so the page can finish scripts/redirects and look more human
+    time.sleep(2)
     try:
-        WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[formcontrolname='code']"))).send_keys(CODE_VALUE)
+        # ensure window is focused and input is clickable (helps when the page isn't active)
+        try:
+            driver.execute_script('window.focus();')
+        except Exception:
+            pass
+        # type the code/password more like a human (per-character)
+        def _human_type(element, text, delay_min=0.04, delay_max=0.12):
+            for ch in str(text):
+                element.send_keys(ch)
+                time.sleep(random.uniform(delay_min, delay_max))
+        code_input = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[formcontrolname='code']")))
+        try:
+            code_input.click()
+        except Exception:
+            pass
+        _human_type(code_input, CODE_VALUE)
         password_input = driver.find_element(By.CSS_SELECTOR, "input[formcontrolname='password']")
-        password_input.send_keys(PASSWORD_VALUE)
-        password_input.send_keys(webdriver.common.keys.Keys.ENTER)
+        try:
+            password_input.click()
+        except Exception:
+            pass
+        _human_type(password_input, PASSWORD_VALUE)
+        # Try clicking the page's submit/login button if available (more robust than ENTER)
+        try:
+            # common patterns: button[type=submit], .login-button, input[type=submit]
+            btn = None
+            for sel in ["button[type='submit']", "button.login-button", "input[type='submit']"]:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                if els:
+                    btn = els[0]
+                    break
+            if btn:
+                try:
+                    btn.click()
+                except Exception:
+                    # fallback to sending ENTER
+                    password_input.send_keys(webdriver.common.keys.Keys.ENTER)
+            else:
+                password_input.send_keys(webdriver.common.keys.Keys.ENTER)
+        except Exception:
+            password_input.send_keys(webdriver.common.keys.Keys.ENTER)
         WebDriverWait(driver, 25).until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".banner-search input, .banner-title input")))
         status_callback("✅ התחברות בוצעה בהצלחה.")
-        logger.info("Login successful.")
         return driver
     except Exception as e:
-        status_callback("❌ שגיאה: התחברות נכשלה.")
-        logger.error(f"Login failed: {e}")
+        status_callback(f"❌ שגיאה: התחברות נכשלה. {e}")
         driver.quit()
         return None
 
@@ -134,114 +313,64 @@ class Scraper:
         self.topics_data = None
         self.temp_download_path = str(Path.home() / 'Downloads' / 'kol_halashon_temp')
         self.final_download_path = str(Path.home())
-        self.download_lock = threading.Lock()
-        # Lock to serialize interactions with the selenium webdriver (not thread-safe)
         self.driver_lock = threading.Lock()
 
+        self.download_queue = queue.Queue()
+        # --- NEW: The "message board" to link file IDs to download IDs ---
+        self.active_downloads = {}
+        self.monitor_lock = threading.Lock()
+
+        self.download_worker_thread = threading.Thread(target=self._download_worker, daemon=True)
+        self.file_monitor_thread = threading.Thread(target=self._file_monitor, daemon=True)
+        self.download_worker_thread.start()
+        self.file_monitor_thread.start()
+
     def set_final_download_path(self, path):
-        # Ensure a dedicated subfolder 'קול הלשון' under the chosen path
         target = os.path.join(path, "קול הלשון")
         os.makedirs(target, exist_ok=True)
         self.final_download_path = target
-
-        # Clear temp download folder when changing final path to avoid stale files
-        try:
-            if os.path.exists(self.temp_download_path):
-                for name in os.listdir(self.temp_download_path):
-                    fp = os.path.join(self.temp_download_path, name)
-                    try:
-                        if os.path.isfile(fp) or os.path.islink(fp):
-                            os.remove(fp)
-                        elif os.path.isdir(fp):
-                            shutil.rmtree(fp)
-                    except Exception as e:
-                        logger.warning(f"Failed to remove temp file {fp}: {e}")
-        except Exception as e:
-            logger.warning(f"Could not clear temp download dir: {e}")
-
-        self._update_status(f"ההורדות הבאות יישמרו ב: {self.final_download_path}")
-        logger.info(f"Final download path set to: {self.final_download_path}")
+        self._update_status(f"ההורדות יישמרו ב: {self.final_download_path}")
 
     def _update_status(self, message):
-        if self.status_callback:
-            self.status_callback(message)
+        if self.status_callback: self.status_callback(message)
             
-    def _update_download_progress(self, download_id, progress, status):
-        if self.download_progress_callback:
-            self.download_progress_callback(download_id, progress, status)
+    def _update_download_progress(self, did, prog, stat):
+        if self.download_progress_callback: self.download_progress_callback(did, prog, stat)
 
     def _js_click(self, element):
         self.driver.execute_script("arguments[0].click();", element)
 
-    def _wait_for_file_ready(self, path, timeout=15, poll_interval=0.5):
-        """Wait until the file exists, is readable and (optionally) stable.
-        Returns True if the file appears ready within timeout, False otherwise.
-        """
-        start = time.time()
-        while time.time() - start < timeout:
-            if not os.path.exists(path):
-                time.sleep(poll_interval)
-                continue
-            try:
-                # Try to open the file for reading to ensure no exclusive lock by antivirus/OS
-                with open(path, 'rb') as fh:
-                    fh.read(1)
-                return True
-            except Exception:
-                time.sleep(poll_interval)
-                continue
+    def _wait_for_file_ready(self, path, timeout=15):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if os.path.exists(path):
+                try:
+                    with open(path, 'rb') as f: f.read(1)
+                    return True
+                except (IOError, PermissionError): time.sleep(0.5)
+            else: time.sleep(0.5)
         return False
 
-    def _try_move_file(self, src_path, dest_dir, max_attempts=3, wait_ready_timeout=15, attempt_delay=0.8):
-        """Try to move src_path into dest_dir with retries and readiness checks.
-        Returns destination_path on success, or None on failure.
-        """
-        if not os.path.exists(src_path):
+    def _try_move_file(self, src_path, dest_dir, max_attempts=5, wait_timeout=20):
+        if not self._wait_for_file_ready(src_path, timeout=wait_timeout):
+            logger.warning(f"File never became ready: {src_path}")
             return None
         filename = os.path.basename(src_path)
-        dest_path = os.path.join(dest_dir, filename)
-        attempt = 0
-        while attempt < max_attempts:
-            attempt += 1
+        for attempt in range(max_attempts):
             try:
-                # wait until file is readable/unlocked
-                if not self._wait_for_file_ready(src_path, timeout=wait_ready_timeout):
-                    logger.debug(f"Move attempt {attempt}: file not ready: {src_path}")
-                    time.sleep(attempt_delay)
-                    continue
-                # ensure unique destination
                 name, ext = os.path.splitext(filename)
-                candidate = dest_path
+                candidate = os.path.join(dest_dir, filename)
                 counter = 1
                 while os.path.exists(candidate):
                     candidate = os.path.join(dest_dir, f"{name} ({counter}){ext}")
                     counter += 1
                 shutil.move(src_path, candidate)
+                logger.info(f"Successfully moved {src_path} to {candidate}")
                 return candidate
-            except FileNotFoundError:
-                logger.warning(f"Move attempt {attempt}: file disappeared before move: {src_path}")
-                return None
             except Exception as e:
-                logger.warning(f"Move attempt {attempt} failed for {src_path}: {e}")
-                time.sleep(attempt_delay)
-                continue
+                logger.warning(f"Move attempt {attempt+1} failed for {src_path}: {e}")
+                time.sleep(1)
         return None
-
-    def _attempt_post_move(self, file_id, expected_filename, start_time):
-        """After a successful primary move, attempt to move any remaining matching mp3s created since start_time."""
-        try:
-            temp_dir = self.temp_download_path
-            candidates = [f for f in os.listdir(temp_dir) if f.lower().endswith('.mp3') and (file_id in f or expected_filename in f) and os.path.getmtime(os.path.join(temp_dir, f)) >= start_time - 0.5]
-            if not candidates:
-                return
-            # sort oldest-first to move in order
-            for c in sorted(candidates, key=lambda f: os.path.getmtime(os.path.join(temp_dir, f))):
-                full = os.path.join(temp_dir, c)
-                dest = self._try_move_file(full, self.final_download_path, max_attempts=4, wait_ready_timeout=20)
-                if dest:
-                    logger.info(f"Post-move moved extra mp3 {full} -> {dest}")
-        except Exception as e:
-            logger.warning(f"Post-move attempt failed: {e}")
 
     def load_topics_from_file(self):
         if self.topics_data: return self.topics_data
@@ -250,423 +379,254 @@ class Scraper:
             self.topics_data = json.load(f)
         return self.topics_data
 
-    def _get_current_shiurim_and_filters(self):
-        self._update_status("טוען שיעורים ומסננים...")
-        logger.info("Extracting shiurim and filters from page.")
+    def get_initial_page_data(self):
+        self._update_status("טוען נתונים ראשוניים...")
         try:
-            shiurim_list = self.driver.execute_script("""
-            let shiurs = [];
-            document.querySelectorAll('app-shiurim-display .shiur-container').forEach((el, i) => {
-                let title = el.querySelector('.shiurim-title')?.textContent.trim() || '';
-                let rav = el.querySelector('.shiurim-rav-name')?.textContent.trim() || '';
-                let date = el.querySelector('.shiurim-start-time')?.textContent.trim() || '';
-                let link = el.querySelector('a')?.href || '';
-                shiurs.push({id: i, title: title, rav: rav, date: date, link: link});
-            });
-            return shiurs;
+            script = """
+            const shiurim = Array.from(document.querySelectorAll('app-shiurim-display .shiur-container')).map((el, i) => ({
+                id: i,
+                title: el.querySelector('.shiurim-title')?.textContent.trim() || '',
+                rav: el.querySelector('.shiurim-rav-name')?.textContent.trim() || '',
+                date: el.querySelector('.shiurim-start-time')?.textContent.trim() || ''
+            }));
+            const filter_categories = Array.from(document.querySelectorAll('app-filter-container .filter-header'))
+                .map(header => header.textContent.trim()).filter(Boolean);
+            return { shiurim, filter_categories };
+            """
+            return self.driver.execute_script(script)
+        except Exception as e:
+            logger.error(f"Failed to get initial page data: {e}")
+            return {'shiurim': [], 'filter_categories': []}
+
+    def expand_and_get_all_filters(self):
+        self._update_status("מרחיב מסננים ברקע...")
+        try:
+            self.driver.execute_script("""
+                document.querySelectorAll('app-filter-container .filter-header').forEach(h => {
+                    const c = h.closest('app-filter-container').querySelector('.filter-container');
+                    if (c && !c.classList.contains('opened')) h.click();
+                });
             """)
+            time.sleep(0.3)
+            for i in range(20):
+                self._update_status(f"מרחיב מסננים... (שלב {i+1})")
+                clicked_something = self.driver.execute_script("""
+                    let clicked = false;
+                    const showMoreButtons = Array.from(document.querySelectorAll(".display-more"))
+                                                .filter(btn => btn.textContent.includes('הצג עוד') && btn.offsetParent);
+                    if (showMoreButtons.length > 0) { showMoreButtons.forEach(btn => btn.click()); clicked = true; }
+                    const closedArrowButtons = Array.from(document.querySelectorAll(".nested-filter-container:not(.expanded-nested-filter-container) .icon-nav-arrow, .scroll-container > .nested-filter-container:not(.expanded-nested-filter-container) .icon-nav-arrow"))
+                                                   .filter(arrow => arrow.offsetParent);
+                    if (closedArrowButtons.length > 0) { closedArrowButtons.forEach(arrow => arrow.click()); clicked = true; }
+                    return clicked;
+                """)
+                if not clicked_something: break
+                time.sleep(0.8)
+            self._update_status("אוסף את רשימת המסננים...")
+            filters_data = self.driver.execute_script("""
+            function getElementText(el) {
+                const title = el.querySelector('.filter-title')?.textContent.trim() || '';
+                const count = el.querySelector('.shiurim-count')?.textContent.trim() || '';
+                if (!title && el.classList.contains('mat-checkbox')) { return el.textContent.trim(); }
+                return `${title} ${count}`.trim();
+            }
+            function parseContainer(container, level) {
+                let results = [];
+                const children = container.querySelectorAll(':scope > .nested-flex-display, :scope > mat-checkbox.filter-option, :scope > .nested-filter-container, :scope > div > mat-checkbox.filter-option');
+                children.forEach(child => {
+                    if (child.matches('mat-checkbox.filter-option, .nested-flex-display')) {
+                        const text = getElementText(child);
+                        if (text) results.push({ text: text, level: level });
+                    } else if (child.matches('.nested-filter-container')) {
+                        results = results.concat(parseContainer(child, level + 1));
+                    }
+                });
+                return results;
+            }
+            const topLevelContainers = document.querySelectorAll('app-filter-container');
+            let allFilters = [];
+            topLevelContainers.forEach(topContainer => {
+                const categoryName = topContainer.querySelector('.filter-header')?.textContent.trim();
+                if (!categoryName) return;
+                allFilters.push({ text: categoryName, level: -1 });
+                const content = topContainer.querySelector('.filter-content > .scroll-container, .filter-content');
+                if (content) allFilters = allFilters.concat(parseContainer(content, 0));
+            });
+            return allFilters;
+            """)
+            self._update_status("טעינת המסננים הושלמה.")
+            return filters_data
         except Exception as e:
-            shiurim_list = []
-            self._update_status("אזהרה: שגיאה בקריאת פרטי השיעורים.")
-            logger.warning(f"Could not extract shiurim via JS: {e}")
-        filters_data = []
-        try:
-            filter_groups = self.driver.find_elements(By.CSS_SELECTOR, "app-filter-container")
-            for group in filter_groups:
-                # find header safely
-                headers = group.find_elements(By.CSS_SELECTOR, ".filter-header")
-                if not headers:
-                    continue
-                header = headers[0]
-                category_title = header.text.strip()
-                if not category_title:
-                    continue
-
-                # open container if needed (guarded)
-                inner_containers = group.find_elements(By.CSS_SELECTOR, ".filter-container")
-                inner_container = inner_containers[0] if inner_containers else None
-                if inner_container:
-                    try:
-                        if "opened" not in inner_container.get_attribute("class"):
-                            self._js_click(header)
-                            time.sleep(0.5)
-                    except Exception:
-                        # ignore and continue
-                        pass
-
-                # try to expand "show more" elements if present
-                while True:
-                    show_mores = group.find_elements(By.XPATH, ".//div[contains(@class, 'display-more') and contains(normalize-space(), 'הצג עוד')]")
-                    if not show_mores:
-                        break
-                    for sm in show_mores:
-                        try:
-                            self._js_click(sm)
-                            time.sleep(0.5)
-                        except Exception:
-                            continue
-
-                try:
-                    WebDriverWait(self.driver, 5).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "mat-checkbox.filter-option")))
-                except Exception:
-                    # continue anyway and try to read what exists
-                    pass
-
-                time.sleep(0.5)
-                options = group.find_elements(By.CSS_SELECTOR, "mat-checkbox.filter-option")
-                category_filters = []
-                for option in options:
-                    label_els = option.find_elements(By.CSS_SELECTOR, ".mat-checkbox-label")
-                    if not label_els:
-                        continue
-                    label_el = label_els[0]
-                    try:
-                        full_label = self.driver.execute_script("return arguments[0].textContent;", label_el).strip().replace('\n', ' ').replace('  ', ' ')
-                        if full_label:
-                            category_filters.append(full_label)
-                    except Exception:
-                        continue
-                if category_filters:
-                    filters_data.append({'category_name': category_title, 'filters': category_filters})
-        except Exception as e:
-            # don't raise an exception to the caller; log a concise message
-            self._update_status(f"אזהרה: לא ניתן היה לטעון מסננים.")
-            logger.warning(f"Could not extract filters: {str(e)}")
-        self._update_status(f"נמצאו {len(shiurim_list)} שיעורים ו-{len(filters_data)} קטגוריות סינון.")
-        logger.info(f"Found {len(shiurim_list)} shiurim and {len(filters_data)} filter categories.")
-        try:
-            # append shiurim list to a log file with timestamp, title and link
-            self._append_shiurim_log(shiurim_list)
-        except Exception as e:
-            logger.warning(f"Failed to write shiurim log: {e}")
-        return {'type': 'shiurim_and_filters', 'data': {'shiurim': shiurim_list, 'filters': filters_data}}
-
-    def _append_shiurim_log(self, shiurim_list):
-        """Append the current list of shiurim to a log file (JSON lines).
-        Each line: {timestamp, title, link}
-        """
-        log_path = Path('shiurim_list.log')
-        now = datetime.utcnow().isoformat() + 'Z'
-        with open(log_path, 'a', encoding='utf-8') as fh:
-            for s in shiurim_list:
-                entry = {'timestamp': now, 'title': s.get('title', ''), 'link': s.get('link', '')}
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._update_status("שגיאה בטעינת המסננים.")
+            logger.error(f"Failed to expand and get filters: {e}", exc_info=True)
+            return []
 
     def _handle_results_page(self):
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self._update_status(f"ממתין לתוצאות (ניסיון {attempt + 1}/{max_retries})...")
-                WebDriverWait(self.driver, 10).until(EC.any_of(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "app-shiurim-display .shiur-container")),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".rav-container"))
-                ))
-                time.sleep(2)
-                rav_results = self.driver.find_elements(By.CSS_SELECTOR, ".rav-container")
-                if rav_results:
-                    try:
-                        WebDriverWait(self.driver, 10).until(
-                            lambda d: d.find_element(By.CSS_SELECTOR, ".rav-container .rav-name").text.strip() != ""
-                        )
-                    except TimeoutException:
-                        logger.warning("Timed out waiting for rav names to load. Proceeding anyway.")
-                    rav_list = self.driver.execute_script("""
-                    let ravs = [];
-                    document.querySelectorAll('.rav-container').forEach((el, i) => {
-                        let name = el.querySelector('.rav-name')?.textContent.trim() || '';
-                        let count = el.querySelector('.rav-shiurim-sum')?.textContent.trim() || '';
-                        ravs.push({id: i, name: name, count: count});
-                    });
-                    return ravs;
-                    """)
-                    if rav_list and rav_list[0]['name']:
-                        return {'type': 'rav_selection', 'data': rav_list}
-                
-                shiurim = self.driver.find_elements(By.CSS_SELECTOR, "app-shiurim-display .shiur-container")
-                if shiurim:
-                    return self._get_current_shiurim_and_filters()
-                
-                raise TimeoutException("Content not fully loaded, retrying...")
-
-            except TimeoutException:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                else:
-                    logger.error("Failed to get results after multiple retries.")
-                    return {'type': 'error', 'message': 'לא נמצאו תוצאות לאחר מספר ניסיונות.'}
-
-    def refresh_current_page_content(self):
-        self._update_status("טוען מחדש נתונים מהעמוד...")
-        logger.info("Re-extracting data from current page (no refresh).")
-        return self._handle_results_page()
+        self._update_status("ממתין לטעינת העמוד...")
+        try:
+            WebDriverWait(self.driver, 15).until(EC.any_of(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "app-shiurim-display .shiur-container")),
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".rav-container"))
+            ))
+            time.sleep(1)
+            if self.driver.find_elements(By.CSS_SELECTOR, ".rav-container"):
+                return {'type': 'rav_selection', 'data': self.driver.execute_script("""
+                    return Array.from(document.querySelectorAll('.rav-container')).map((el, i) => ({
+                        id: i, name: el.querySelector('.rav-name')?.textContent.trim(),
+                        count: el.querySelector('.rav-shiurim-sum')?.textContent.trim()
+                    }));""")}
+            if self.driver.find_elements(By.CSS_SELECTOR, "app-shiurim-display .shiur-container"):
+                try:
+                    WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "app-filter-container")))
+                except TimeoutException:
+                    logger.warning("Filter container did not appear in time.")
+                return {'type': 'initial_data', 'data': self.get_initial_page_data()}
+            return {'type': 'error', 'message': 'לא נמצא תוכן מתאים.'}
+        except TimeoutException:
+            return {'type': 'error', 'message': 'העמוד לא נטען בזמן.'}
 
     def refresh_browser_page(self):
-        self._update_status("מרענן את הדף בדפדפן...")
-        logger.info("Refreshing browser page.")
+        self._update_status("מרענן את הדף...")
         self.driver.refresh()
         return self._handle_results_page()
 
+    def refresh_current_page_content(self):
+        self._update_status("טוען נתונים מחדש...")
+        return self._handle_results_page()
+
     def perform_search(self, query: str):
-        self._update_status(f"מבצע חיפוש: '{query}'...")
-        logger.info(f"Performing search for: '{query}'")
+        self._update_status(f"חיפוש: '{query}'...")
         search_type = "ravSearch" if query.strip().startswith("הרב") else "searchResults"
-        encoded_query = urllib.parse.quote(query)
-        self.driver.execute_script(f"window.location.hash = '#/regularSite/{search_type}/{encoded_query}';")
+        self.driver.get(f"https://www2.kolhalashon.com/#/regularSite/{search_type}/{urllib.parse.quote(query)}")
         return self._handle_results_page()
 
     def navigate_to_topic_by_href(self, href: str):
         self._update_status("מנווט לקטגוריה...")
-        logger.info(f"Navigating to topic: {href}")
         self.driver.get(href)
         return self._handle_results_page()
 
     def select_rav_from_results(self, rav_id: int):
-        self._update_status("בוחר רב מהרשימה...")
-        logger.info(f"Selecting rav with ID: {rav_id}")
-        fresh_rav_results = self.driver.find_elements(By.CSS_SELECTOR, ".rav-container")
-        if rav_id >= len(fresh_rav_results):
-            self._update_status("❌ שגיאה: הרב הנבחר לא נמצא. נסה לרענן.")
-            logger.error(f"IndexError: rav_id {rav_id} is out of bounds for results list of size {len(fresh_rav_results)}.")
-            return {'type': 'error', 'message': 'הרב לא נמצא'}
-        self._js_click(fresh_rav_results[rav_id].find_element(By.CSS_SELECTOR, "a.rav-name"))
+        self._update_status("בוחר רב...")
+        with self.driver_lock:
+            rav_links = self.driver.find_elements(By.CSS_SELECTOR, ".rav-container a.rav-name")
+            if rav_id < len(rav_links): self._js_click(rav_links[rav_id])
+            else: return {'type': 'error', 'message': 'הרב לא נמצא.'}
         return self._handle_results_page()
 
     def apply_filter_by_name(self, filter_name: str):
         self._update_status(f"מפעיל מסנן: {filter_name}...")
-        logger.info(f"Applying filter: {filter_name}")
         try:
-            first_shiur_element = None
-            try:
-                first_shiur_element = self.driver.find_element(By.CSS_SELECTOR, "app-shiurim-display .shiur-container")
-            except NoSuchElementException:
-                pass 
-            
-            click_script = """
-            const filterName = arguments[0];
-            const checkboxes = document.querySelectorAll('mat-checkbox.filter-option');
-            for (const cb of checkboxes) {
-                const label = cb.querySelector('.mat-checkbox-label');
-                if (label && label.textContent.trim().includes(filterName)) {
-                    cb.querySelector('input').click();
-                    return true;
-                }
-            }
-            return false;
-            """
-            clicked = self.driver.execute_script(click_script, filter_name)
-            if not clicked:
-                raise Exception("לא נמצא מסנן עם השם המבוקש.")
-
-            if first_shiur_element:
-                WebDriverWait(self.driver, 20).until(EC.staleness_of(first_shiur_element))
-            
+            with self.driver_lock:
+                first_shiur = self.driver.find_element(By.CSS_SELECTOR, "app-shiurim-display .shiur-container")
+                self.driver.execute_script("""
+                    const filterText = arguments[0];
+                    for (const cb of document.querySelectorAll('mat-checkbox')) {
+                        const labelContent = Array.from(cb.querySelectorAll('.filter-title, .shiurim-count'))
+                                                  .map(el => el.textContent.trim()).join(' ').trim();
+                        if (labelContent === filterText || cb.textContent.trim() === filterText) {
+                            cb.querySelector('input').click(); return;
+                        }
+                    }
+                """, filter_name)
+                WebDriverWait(self.driver, 20).until(EC.staleness_of(first_shiur))
             return self._handle_results_page()
         except Exception as e:
-            logger.error(f"Error in apply_filter_by_name for '{filter_name}': {e}")
-            self._update_status(f"❌ שגיאה בהפעלת המסנן: {filter_name}")
-            return {'type': 'error', 'message': f'שגיאה בהפעלת המסנן'}
+            return {'type': 'error', 'message': f'שגיאה בהפעלת המסנן: {e}'}
+
+    def queue_download(self, shiur_id, title, did):
+        self.download_queue.put({'shiur_id': shiur_id, 'title': title, 'did': did})
+        self._update_download_progress(did, 0, "starting")
+
+    def _download_worker(self):
+        while True:
+            task = self.download_queue.get()
+            shiur_id, title, did = task['shiur_id'], task['title'], task['did']
             
-    def download_shiur_by_id(self, shiur_id: int, shiur_title: str):
-        """Start a download for the given shiur. This monitors the temp download directory for
-        a new file (either a .crdownload that completes or a new .mp3) and moves it to the final
-        download path. Only the final move is serialized by a lock so multiple downloads can run
-        concurrently.
-        """
-        download_id = f"{shiur_id}_{int(time.time())}"
-        self._update_download_progress(download_id, 0, "starting")
+            self._update_status(f"מתחיל הורדה: {title}")
+            try:
+                with self.driver_lock:
+                    shiur_elements = self.driver.find_elements(By.CSS_SELECTOR, "app-shiurim-display .shiur-container")
+                    if shiur_id >= len(shiur_elements):
+                        raise IndexError("Shiur ID out of bounds")
+                    
+                    try:
+                        phone_button = shiur_elements[shiur_id].find_element(By.XPATH, ".//button[contains(@class, 'click-phone-button')]")
+                        file_id = phone_button.text.strip()
+                        if file_id:
+                            with self.monitor_lock:
+                                self.active_downloads[file_id] = did
+                                logger.info(f"Registered download: file_id {file_id} maps to did {did}")
+                    except NoSuchElementException:
+                        logger.warning(f"Could not find file_id for {title}. UI update will not work for this download.")
 
-        try:
-            self._update_status(f"מתחיל הורדה: {shiur_title}")
-            logger.info(f"Initiating download for shiur ID: {shiur_id}")
+                    download_button = shiur_elements[shiur_id].find_element(By.XPATH, ".//button[.//svg-icon[contains(@src, 'download-i.svg')]]")
+                    self._js_click(download_button)
+                    
+                    try:
+                        audio_option = WebDriverWait(self.driver, 5).until(EC.visibility_of_element_located((By.XPATH, "//div[contains(@class, 'download-option')]")))
+                        self._js_click(audio_option)
+                    except TimeoutException:
+                        pass
+                    
+                    time.sleep(1.5) 
+            except Exception as e:
+                logger.error(f"Failed to initiate download for {title}: {e}")
+                self._update_download_progress(did, 0, "failed")
+            
+            self.download_queue.task_done()
+            time.sleep(1)
 
-            # All direct webdriver/DOM access must be serialized to avoid concurrent webdriver calls
-            with self.driver_lock:
-                shiur_elements = self.driver.find_elements(By.CSS_SELECTOR, "app-shiurim-display .shiur-container")
-                phone_button = shiur_elements[shiur_id].find_element(By.XPATH, ".//button[contains(@class, 'click-phone-button')]")
-                file_id = phone_button.text.strip()
+    def _file_monitor(self):
+        processed_files = set()
+        while True:
+            try:
+                all_files = set(os.listdir(self.temp_download_path))
+                completed_files = [f for f in all_files if not f.endswith(('.crdownload', '.tmp')) and f not in processed_files]
 
-            # Build expected filename (sanitized) but be tolerant if Chrome names it slightly different
-            expected_filename = f"{shiur_title} - {file_id}.mp3"
-            invalid_chars = '<>:"/\\|?*'
-            for char in invalid_chars:
-                expected_filename = expected_filename.replace(char, '')
-
-            temp_dir = self.temp_download_path
-            os.makedirs(temp_dir, exist_ok=True)
-
-            # Snapshot existing files so we can detect the new one
-            before_files = set(os.listdir(temp_dir))
-            logger.debug(f"Download {download_id} before_files: {before_files}")
-
-            # Trigger download in browser --- serialize access to the webdriver
-            with self.driver_lock:
-                self._js_click(shiur_elements[shiur_id].find_element(By.XPATH, ".//button[.//svg-icon[contains(@src, 'download-i.svg')]]"))
-                try:
-                    audio_option = WebDriverWait(self.driver, 5).until(EC.visibility_of_element_located((By.XPATH, "//div[contains(@class, 'download-option')]") ))
-                    self._js_click(audio_option)
-                except TimeoutException:
-                    # Not all downloads present an additional option
-                    pass
-
-            self._update_status("מוריד...")
-            logger.info(f"Waiting for download (looking in {temp_dir}) for pattern containing '{file_id}' or '{expected_filename}'")
-
-            wait_time = 600
-            start_time = time.time()
-            completed_path = None
-
-            # Continuously look for any new files (mp3 or .crdownload) that were NOT present before the download started
-            processed = set()
-            while time.time() - start_time < wait_time:
-                current_files = set(os.listdir(temp_dir))
-                # candidates = new files that were not in before_files and not already processed
-                candidates = [f for f in current_files if f not in before_files and f not in processed and (f.lower().endswith('.mp3') or f.endswith('.crdownload'))]
-                logger.debug(f"Download {download_id} candidates (new files): {candidates}")
-
-                for candidate in sorted(candidates, key=lambda f: os.path.getmtime(os.path.join(temp_dir, f))):
-                    full = os.path.join(temp_dir, candidate)
-                    # Process any new candidate regardless of filename — user requested moving all new files
-                    # If it's a .crdownload, wait until it's replaced by final file or disappears
-                    if candidate.endswith('.crdownload'):
-                        final_name = candidate[:-len('.crdownload')]
-                        final_path = os.path.join(temp_dir, final_name)
-                        inner_start = time.time()
-                        while time.time() - inner_start < wait_time:
-                            # Only proceed if final filename matches our expected id/name
-                            if os.path.exists(final_path) and (file_id in final_name or expected_filename in final_name):
-                                # ready to move
-                                with self.download_lock:
-                                    destination_filename = os.path.basename(final_path)
-                                    destination_path = os.path.join(self.final_download_path, destination_filename)
-                                    counter = 1
-                                    while os.path.exists(destination_path):
-                                        name, ext = os.path.splitext(destination_filename)
-                                        destination_path = os.path.join(self.final_download_path, f"{name} ({counter}){ext}")
-                                        counter += 1
-                                    # Try moving with retries
-                                    dest = self._try_move_file(final_path, self.final_download_path, max_attempts=4, wait_ready_timeout=20)
-                                    if not dest:
-                                        logger.warning(f"Failed to move final file after retries: {final_path}")
-                                        continue
-                                processed.add(candidate)
-                                self._update_download_progress(download_id, 1, "moving")
-                                logger.info(f"Moved completed download {final_path} -> {dest}")
-                                # attempt to move any remaining matching files
-                                try:
-                                    self._attempt_post_move(file_id, expected_filename, start_time)
-                                except Exception:
-                                    pass
+                for fname in completed_files:
+                    full_path = os.path.join(self.temp_download_path, fname)
+                    processed_files.add(fname)
+                    
+                    did_to_update = None
+                    file_id_found = None
+                    with self.monitor_lock:
+                        for file_id, did in self.active_downloads.items():
+                            if file_id in fname:
+                                did_to_update = did
+                                file_id_found = file_id
                                 break
-                            # if .crdownload disappeared but final file name different, pick newest mp3
-                            if not os.path.exists(full):
-                                # consider only mp3 files that match this download's id or expected filename
-                                mps = [f for f in os.listdir(temp_dir) if f.lower().endswith('.mp3') and (file_id in f or expected_filename in f)]
-                                if mps:
-                                    candidates_mp3 = sorted(mps, key=lambda f: os.path.getmtime(os.path.join(temp_dir, f)), reverse=True)
-                                    mp3_full = os.path.join(temp_dir, candidates_mp3[0])
-                                    # Try moving detected mp3 with retries
-                                    dest = self._try_move_file(mp3_full, self.final_download_path, max_attempts=4, wait_ready_timeout=20)
-                                    if not dest:
-                                        logger.warning(f"Failed to move detected mp3 after retries: {mp3_full}")
-                                        continue
-                                    processed.add(candidate)
-                                    self._update_download_progress(download_id, 1, "moving")
-                                    logger.info(f"Moved detected mp3 {mp3_full} -> {dest}")
-                                    # attempt post move of any extras
-                                    try:
-                                        self._attempt_post_move(file_id, expected_filename, start_time)
-                                    except Exception:
-                                        pass
-                                    break
-                            time.sleep(0.5)
-                    elif candidate.lower().endswith('.mp3'):
-                        # ensure this mp3 matches this download
-                        if not ((file_id in candidate) or (expected_filename in candidate)):
-                            logger.debug(f"Skipping mp3 for download {download_id}: not matching: {candidate}")
-                            continue
-                        # ensure stable size
-                        p = os.path.join(temp_dir, candidate)
-                        try:
-                            size1 = os.path.getsize(p)
-                            time.sleep(0.8)
-                            size2 = os.path.getsize(p)
-                            if size1 == size2 and size1 > 0:
-                                with self.download_lock:
-                                    destination_filename = os.path.basename(p)
-                                    destination_path = os.path.join(self.final_download_path, destination_filename)
-                                    counter = 1
-                                    while os.path.exists(destination_path):
-                                        name, ext = os.path.splitext(destination_filename)
-                                        destination_path = os.path.join(self.final_download_path, f"{name} ({counter}){ext}")
-                                        counter += 1
-                                    # Try moving mp3 with retries
-                                    dest = self._try_move_file(p, self.final_download_path, max_attempts=4, wait_ready_timeout=20)
-                                    if not dest:
-                                        logger.warning(f"Failed to move mp3 after retries: {p}")
-                                        continue
-                                processed.add(candidate)
-                                self._update_download_progress(download_id, 1, "moving")
-                                logger.info(f"Moved mp3 {p} -> {dest}")
-                                try:
-                                    self._attempt_post_move(file_id, expected_filename, start_time)
-                                except Exception:
-                                    pass
-                        except OSError:
-                            pass
+                    
+                    if self._try_move_file(full_path, self.final_download_path):
+                        logger.info(f"Moved downloaded file: {fname}")
+                        if did_to_update:
+                            self._update_download_progress(did_to_update, 1, "completed")
+                            with self.monitor_lock:
+                                del self.active_downloads[file_id_found]
+                    else:
+                        logger.error(f"Failed to move {fname} from temp folder.")
+                        if did_to_update:
+                            self._update_download_progress(did_to_update, 0, "failed")
+                            with self.monitor_lock:
+                                del self.active_downloads[file_id_found]
+                
+                if len(processed_files) > 100:
+                    processed_files.clear()
 
-                if processed:
-                    # mark completed and exit loop
-                    self._update_status(f"✅ הורדה הושלמה: {shiur_title}")
-                    self._update_download_progress(download_id, 1, "completed")
-                    break
+            except Exception as e:
+                logger.error(f"Error in file monitor: {e}")
+            
+            time.sleep(2)
 
-                time.sleep(0.5)
-
-            if not processed:
-                # final fallback: try to move any mp3 created since start_time that were not present before
-                try:
-                    candidates_all = [f for f in os.listdir(temp_dir) if f.lower().endswith('.mp3') and f not in before_files and os.path.getmtime(os.path.join(temp_dir, f)) >= start_time - 0.5]
-                    logger.warning(f"Download {download_id} timed out strict matching; fallback ALL mp3 candidates (not in before_files): {candidates_all}")
-                    if candidates_all:
-                        # try moving each candidate (oldest-first) with retries
-                        for fname in sorted(candidates_all, key=lambda f: os.path.getmtime(os.path.join(temp_dir, f))):
-                            mp3_full = os.path.join(temp_dir, fname)
-                            dest = self._try_move_file(mp3_full, self.final_download_path, max_attempts=6, wait_ready_timeout=30, attempt_delay=1.0)
-                            if dest:
-                                processed.add(fname)
-                                self._update_download_progress(download_id, 1, "moving")
-                                self._update_status(f"✅ הורדה הושלמה (fallback all): {shiur_title}")
-                                logger.info(f"Fallback ALL moved mp3 {mp3_full} -> {dest} for download {download_id}")
-                        # after attempting all, also try post-move cleanup for any other matching files
-                        try:
-                            self._attempt_post_move(file_id, expected_filename, start_time)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    logger.error(f"Fallback ALL move failed for download {download_id}: {e}")
-
-            if not processed:
-                raise Exception("Download timed out or file not detected in temp directory")
-
-        except Exception as e:
-            logger.error(f"Download failed for shiur {shiur_id}: {e}")
-            self._update_status(f"❌ הורדה נכשלה: {shiur_title}")
-            self._update_download_progress(download_id, 0, "failed")
-        
     def navigate_to_next_page(self):
         try:
             self._update_status("עובר לעמוד הבא...")
-            logger.info("Navigating to next page.")
-            next_button = self.driver.find_element(By.CSS_SELECTOR, "app-pagination-options .next:not(.disabled)")
-            self._js_click(next_button)
+            with self.driver_lock:
+                next_button = self.driver.find_element(By.CSS_SELECTOR, "app-pagination-options .next:not(.disabled)")
+                self._js_click(next_button)
             return self._handle_results_page()
         except NoSuchElementException:
             self._update_status("אין עמוד הבא.")
-            logger.info("No next page button found.")
             return None
 
     def close_driver(self):
-        if self.driver:
-            logger.info("Closing webdriver.")
-            self.driver.quit()
+        if self.driver: self.driver.quit()
